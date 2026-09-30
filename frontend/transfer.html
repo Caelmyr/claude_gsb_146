@@ -76,7 +76,7 @@
 
         <!-- ================= 下载 ================= -->
         <div class="card">
-          <div class="card-title">⇩ 分段下载 <span class="hint">HTTP Range 分段拉取 · 副本轮询与故障转移</span></div>
+          <div class="card-title">⇩ 多副本并行分段下载 <span class="hint">同一段多副本可服务 · 并行拉取 · 任一节点失败自动换源</span></div>
 
           <div class="form-row" style="margin-bottom:12px">
             <label class="fl" style="flex:1">文件路径
@@ -84,10 +84,21 @@
             </label>
             <label class="fl">分段大小
               <select id="dl-seg">
-                <option value="65536">64 KiB</option>
-                <option value="131072" selected>128 KiB</option>
-                <option value="524288">512 KiB</option>
-                <option value="1048576">1 MiB</option>
+                <option value="65536">64 KiB（1 块）</option>
+                <option value="131072" selected>128 KiB（2 块）</option>
+                <option value="262144">256 KiB（4 块）</option>
+                <option value="524288">512 KiB（8 块）</option>
+                <option value="1048576">1 MiB（16 块）</option>
+              </select>
+            </label>
+            <label class="fl">并行路数
+              <select id="dl-workers">
+                <option value="auto" selected>自动</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+                <option value="4">4</option>
+                <option value="6">6</option>
+                <option value="8">8</option>
               </select>
             </label>
             <button class="btn" id="dl-pick">浏览…</button>
@@ -96,8 +107,9 @@
           <div id="dl-info" class="small muted" style="margin-bottom:10px">输入路径后点「查询」</div>
           <div class="btn-group" style="margin-bottom:12px">
             <button class="btn" id="dl-query">查询</button>
-            <button class="btn primary" id="dl-start" disabled>开始下载</button>
+            <button class="btn primary" id="dl-start" disabled>并行下载</button>
             <button class="btn" id="dl-pause" disabled>暂停</button>
+            <button class="btn ghost" id="dl-reset" disabled>清空</button>
             <button class="btn ok" id="dl-save" disabled>保存到本地</button>
           </div>
 
@@ -107,7 +119,12 @@
           </div>
           <div class="small muted" id="dl-status">就绪</div>
 
-          <div id="dl-nodes" class="small" style="margin-top:10px"></div>
+          <!-- 分段条：每格一个段，颜色=实际服务节点 -->
+          <div class="piece-grid" id="dl-segs" style="margin-top:10px"></div>
+          <div class="legend" id="dl-legend" style="display:none"></div>
+
+          <!-- 各节点实时贡献 -->
+          <div id="dl-nodes" class="small" style="margin-top:12px"></div>
           <div id="dl-result" style="display:none;margin-top:12px"></div>
         </div>
       </div>
@@ -350,20 +367,36 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ------------------------------------------------------------------ 下载
 let dlInfo = null;
-let dlState = null;   // {paused, aborted, chunks:[], offset}
+let dlState = null;   // 并行下载状态（见 startDownload）
+
+// 节点固定配色（最多 8 路），任一节点贡献段都用同一颜色
+const NODE_COLORS = ["#4f8cff", "#2fbf71", "#f0a538", "#b78cff",
+                     "#e5534b", "#39bcd0", "#e879a8", "#8aa0b4"];
+const NODE_COLOR_MAP = {};
+function nodeColor(n) {
+  if (NODE_COLOR_MAP[n] === undefined) {
+    const used = new Set(Object.values(NODE_COLOR_MAP));
+    NODE_COLOR_MAP[n] = NODE_COLORS.find(c => !used.has(c)) || NODE_COLORS[0];
+  }
+  return NODE_COLOR_MAP[n];
+}
 
 document.getElementById("dl-query").onclick = async () => {
   const path = document.getElementById("dl-path").value.trim();
   if (!path) return toast("请输入文件路径", "warn");
   try {
     dlInfo = await api("GET", "/api/download/info?path=" + encodeURIComponent(path));
+    // 让 info 里出现的节点先占好颜色，保证多次下载颜色稳定
+    (dlInfo.nodes || []).forEach(n => nodeColor(n.id));
     document.getElementById("dl-info").innerHTML = `
       <b>${esc(dlInfo.name)}</b> · ${fmtBytes(dlInfo.size)} · ${esc(dlInfo.mime)} ·
-      ${dlInfo.blocks.length} 块 · sha256 <span class="mono">${esc(dlInfo.content_hash.slice(0, 20))}…</span>
+      ${dlInfo.blocks.length} 块 × ${fmtBytes(dlInfo.block_size)} · sha256
+      <span class="mono">${esc(dlInfo.content_hash.slice(0, 20))}…</span>
       <div class="small" style="margin-top:4px">副本分布：${dlInfo.blocks.map(b =>
         `<span class="chip" title="${esc(b.id)}">${esc(b.checksum.slice(0, 6))}→[${esc(b.replicas.join(","))}]</span>`).join(" ")}</div>`;
     document.getElementById("dl-start").disabled = dlInfo.size === 0;
     document.getElementById("dl-result").style.display = "none";
+    resetDlView();
   } catch (e) {
     dlInfo = null;
     document.getElementById("dl-info").textContent = "查询失败：" + e.message;
@@ -400,7 +433,14 @@ document.getElementById("dl-pause").onclick = () => {
   if (!dlState) return;
   dlState.paused = !dlState.paused;
   document.getElementById("dl-pause").textContent = dlState.paused ? "继续" : "暂停";
-  setDlStatus(dlState.paused ? "已暂停（记住偏移量，可断点续传）" : "继续下载…");
+  setDlStatus(dlState.paused ? "已暂停（已完成的段保留，可继续）" : "继续并行下载…");
+};
+document.getElementById("dl-reset").onclick = () => {
+  if (dlState) dlState.aborted = true;
+  dlState = null;
+  resetDlView();
+  setDlStatus("就绪");
+  document.getElementById("dl-start").disabled = !(dlInfo && dlInfo.size > 0);
 };
 
 function setDlStatus(t) { document.getElementById("dl-status").textContent = t; }
@@ -409,89 +449,297 @@ function setDlPct(p) {
   document.getElementById("dl-pct").textContent = p.toFixed(1) + "%";
 }
 
+function resetDlView() {
+  setDlPct(0);
+  document.getElementById("dl-segs").innerHTML = "";
+  document.getElementById("dl-legend").style.display = "none";
+  document.getElementById("dl-legend").innerHTML = "";
+  document.getElementById("dl-nodes").innerHTML = "";
+  document.getElementById("dl-result").style.display = "none";
+  document.getElementById("dl-save").disabled = true;
+  document.getElementById("dl-pause").disabled = true;
+  document.getElementById("dl-pause").textContent = "暂停";
+  document.getElementById("dl-reset").disabled = true;
+}
+
+// 段条：done=按节点上色；active=节点色描边脉冲；retry=警告色
+function renderDlSegments(total) {
+  const box = document.getElementById("dl-segs");
+  const shown = Math.min(total, 240);
+  let html = "";
+  for (let i = 0; i < shown; i++)
+    html += `<span class="piece dl-seg" id="ds-${i}" title="段 ${i}">${i}</span>`;
+  if (total > shown) html += `<span class="piece" title="…">+${total - shown}</span>`;
+  box.innerHTML = html;
+}
+function setSegState(i, cls, node, bytes) {
+  const el = document.getElementById("ds-" + i);
+  if (!el) return;
+  if (cls === "done" && node) {
+    const c = nodeColor(node);
+    el.className = "piece dl-seg done";
+    el.style.background = c + "33";
+    el.style.borderColor = c;
+    el.style.color = c;
+    el.title = `段 ${i} · ${node} 贡献 ${fmtBytes(bytes || 0)}`;
+  } else {
+    el.className = "piece dl-seg " + cls;
+    el.style.background = "";
+    el.title = `段 ${i}` + (node ? ` · 尝试 ${node}` : "");
+  }
+}
+
 async function startDownload() {
-  if (!dlInfo) return;
+  if (!dlInfo || !dlInfo.size) return;
   const seg = +document.getElementById("dl-seg").value;
   const path = dlInfo.path || document.getElementById("dl-path").value.trim();
-  const from = dlState && dlState.partial && dlState.path === path ? dlState.offset : 0;
-  const parts = dlState && dlState.partial && dlState.path === path ? dlState.chunks : [];
-  dlState = { paused: false, aborted: false, chunks: parts, offset: from,
-              path, nodeHits: dlState?.nodeHits || {}, segs: 0, retries: 0, partial: true };
+
+  // 段按系统块大小对齐（seg 已是 BLOCK_SIZE 的整数倍）：每个段恰好覆盖整数个块，
+  // 这样一次 Range 请求内的所有块都可稳定指派给同一个首选副本节点。
+  const totalSegs = Math.ceil(dlInfo.size / seg);
+  // 段索引 -> 该段覆盖块的可用节点集合（取交集，保证首选节点持有整段）
+  const segNodes = [];
+  for (let i = 0; i < totalSegs; i++) {
+    const sOff = i * seg, eOff = Math.min(sOff + seg, dlInfo.size) - 1;
+    let common = null;
+    for (const b of dlInfo.blocks) {
+      if (b.offset + b.size - 1 < sOff || b.offset > eOff) continue;
+      const set = new Set(b.replicas);
+      common = common === null ? set : new Set([...common].filter(x => set.has(x)));
+    }
+    segNodes.push([...(common || [])].sort());
+  }
+  const allLive = [...new Set(segNodes.flat())];
+  let workers = +document.getElementById("dl-workers").value;
+  if (!workers) workers = Math.max(2, Math.min(4, allLive.length || 2));
+  workers = Math.max(1, Math.min(workers, 8));
+
+  dlState = {
+    paused: false, aborted: false, path, seg, totalSegs, workers,
+    done: new Array(totalSegs).fill(null),   // 每段 -> ArrayBuffer（按下标存放）
+    segNodes, completed: 0, bytes: 0,
+    nodeBytes: {},   // 节点 -> 已贡献字节数（随下载动态更新）
+    nodeReqs: {},    // 节点 -> 服务段数
+    nodeFails: {},   // 节点 -> 失败/被换源次数
+    active: new Set(),
+    retries: 0, failovers: 0,
+    inflight: {},    // node -> 进行中请求数（负载均衡）
+    t0: performance.now(),
+  };
+
   document.getElementById("dl-start").disabled = true;
   document.getElementById("dl-pause").disabled = false;
+  document.getElementById("dl-reset").disabled = false;
   document.getElementById("dl-save").disabled = true;
   document.getElementById("dl-pause").textContent = "暂停";
-  if (from > 0) setDlStatus(`断点续传：从 ${fmtBytes(from)} 处继续`);
+  document.getElementById("dl-result").style.display = "none";
+  renderDlSegments(totalSegs);
+  renderNodeContrib();
+  setDlStatus(`并行下载中… ${workers} 路并行 · ${totalSegs} 段`);
 
-  const t0 = performance.now();
-  let off = from;
-  while (off < dlInfo.size) {
-    if (dlState.aborted) break;
-    while (dlState.paused) await sleep(250);
-    const len = Math.min(seg, dlInfo.size - off);
-    const ctrl = new AbortController();
-    let chaosTimer = null;
-    try {
-      if (CHAOS() && Math.random() < 0.22) {
-        chaosTimer = setTimeout(() => ctrl.abort(), 40 + Math.random() * 200);
-      }
-      const resp = await fetch(
-        `/api/download?path=${encodeURIComponent(path)}&offset=${off}&length=${len}`,
-        { headers: { Authorization: "Bearer " + getToken() }, signal: ctrl.signal });
-      if (chaosTimer) clearTimeout(chaosTimer);
-      if (!resp.ok && resp.status !== 206) throw new Error("HTTP " + resp.status);
-      const buf = await resp.arrayBuffer();
-      const served = (resp.headers.get("X-Served-By") || "").split(",").filter(Boolean);
-      served.forEach(n => dlState.nodeHits[n] = (dlState.nodeHits[n] || 0) + 1);
-      parts.push(buf);
-      off += buf.byteLength;
-      dlState.offset = off;
-      dlState.segs++;
-      setDlPct(off / dlInfo.size * 100);
-      const speed = off / ((performance.now() - t0) / 1000);
-      setDlStatus(`下载中 ${fmtBytes(off)} / ${fmtBytes(dlInfo.size)} · ${fmtBytes(speed)}/s · 段 ${dlState.segs}`);
-      renderNodeHits();
-    } catch (e) {
-      if (chaosTimer) clearTimeout(chaosTimer);
-      dlState.retries++;
-      setDlStatus(`段 @${fmtBytes(off)} 失败（${e.message === "The user aborted a request." ? "混沌中断" : e.message}），重试 …`);
-      await sleep(400);
+  // ---- 动态 UI（节点贡献占比/速率随下载实时刷新）----
+  const uiTimer = setInterval(() => {
+    if (!dlState || dlState.aborted) return clearInterval(uiTimer);
+    renderNodeContrib();
+    const speed = dlState.bytes / ((performance.now() - dlState.t0) / 1000);
+    setDlStatus(`并行下载中 ${fmtBytes(dlState.bytes)} / ${fmtBytes(dlInfo.size)} · ` +
+      `${fmtBytes(speed)}/s · 完成 ${dlState.completed}/${totalSegs} 段 · 拉取中 ${dlState.active.size} · ` +
+      `自动换源 ${dlState.failovers} 次`);
+  }, 250);
+
+  // ---- 为段选首选节点：持有整段副本的节点中当前最空闲者 ----
+  const pickNode = (i) => {
+    const cands = dlState.segNodes[i];
+    if (!cands.length) return null;
+    let best = cands[0], bestLoad = Infinity;
+    for (const n of cands) {
+      const load = (dlState.inflight[n] || 0) * 1000 + (dlState.nodeBytes[n] || 0);
+      if (load < bestLoad) { bestLoad = load; best = n; }
     }
-  }
+    return best;
+  };
+
+  const fetchOne = async (i) => {
+    const off = i * dlState.seg;
+    const len = Math.min(dlState.seg, dlInfo.size - off);
+    let attempt = 0;
+    let node = null;
+    while (!dlState.aborted) {
+      while (dlState.paused && !dlState.aborted) await sleep(200);
+      if (dlState.aborted) return;
+      node = pickNode(i);
+      if (!node) { // 此刻无可用副本（节点可能正在恢复），稍后重试
+        dlState.retries++;
+        setSegState(i, "retry");
+        await sleep(500 + Math.random() * 300);
+        attempt++;
+        continue;
+      }
+      dlState.inflight[node] = (dlState.inflight[node] || 0) + 1;
+      dlState.active.add(i);
+      setSegState(i, "active", node);
+      const ctrl = new AbortController();
+      let chaosTimer = null;
+      if (CHAOS() && Math.random() < 0.25)
+        chaosTimer = setTimeout(() => ctrl.abort(), 40 + Math.random() * 220);
+      try {
+        const resp = await fetch(
+          `/api/download?path=${encodeURIComponent(path)}&offset=${off}&length=${len}` +
+          `&node=${encodeURIComponent(node)}`,
+          { headers: { Authorization: "Bearer " + getToken() }, signal: ctrl.signal });
+        if (chaosTimer) clearTimeout(chaosTimer);
+        if (!resp.ok && resp.status !== 206) throw new Error("HTTP " + resp.status);
+        const buf = await resp.arrayBuffer();
+        if (buf.byteLength !== len) throw new Error(`长度不符 ${buf.byteLength}/${len}`);
+
+        // 实际服务归属：优先解析服务端逐块映射（首选节点不可用时 NN 会换源）
+        const mapStr = resp.headers.get("X-Block-Map") || "";
+        const contrib = {};   // node -> bytes
+        let touched = 0;
+        for (const tok of mapStr.split(",")) {
+          const m = tok.match(/^(.+)@([^@:]+):(\d+)$/);
+          if (!m) continue;
+          contrib[m[2]] = (contrib[m[2]] || 0) + (+m[3]);
+          touched++;
+        }
+        if (!touched) { // 兜底
+          const served = (resp.headers.get("X-Served-By") || node).split(",")[0];
+          contrib[served] = len;
+        }
+        const sumBytes = Object.values(contrib).reduce((a, b) => a + b, 0);
+        if (sumBytes !== len) throw new Error("归属字节数与段长不符");
+        const cr = resp.headers.get("Content-Range") || "";
+        if (cr && !cr.endsWith(`/${dlInfo.size}`))
+          throw new Error("Content-Range 文件大小不匹配");
+
+        // 段入账：仅校验通过的完整段才计入节点贡献
+        dlState.done[i] = buf;
+        dlState.completed++;
+        dlState.bytes += len;
+        for (const [n, b] of Object.entries(contrib)) {
+          dlState.nodeBytes[n] = (dlState.nodeBytes[n] || 0) + b;
+          dlState.nodeReqs[n] = (dlState.nodeReqs[n] || 0) + 1;
+        }
+        for (const n of Object.keys(contrib)) {
+          if (n !== node) {   // 服务端自动故障转移到了别的节点
+            dlState.failovers++;
+            dlState.nodeFails[node] = (dlState.nodeFails[node] || 0) + 1;
+          }
+        }
+        const primary = Object.entries(contrib).sort((a, b) => b[1] - a[1])[0][0];
+        setSegState(i, "done", primary, len);
+        setDlPct(dlState.bytes / dlInfo.size * 100);
+        renderNodeContrib();
+        return;
+      } catch (e) {
+        if (chaosTimer) clearTimeout(chaosTimer);
+        dlState.retries++;
+        dlState.nodeFails[node] = (dlState.nodeFails[node] || 0) + 1;
+        if (attempt === 0) dlState.failovers++;
+        setSegState(i, "retry", node);
+        const why = e.name === "AbortError" ? "混沌中断" : e.message;
+        setDlStatus(`段 ${i} 在节点 ${node} 失败（${why}），自动改用其它副本节点补齐 …`);
+        await sleep(Math.min(800, 150 * (attempt + 1)) + Math.random() * 150);
+        attempt++;
+        if (attempt > 12) {
+          dlState.aborted = true;
+          dlState.fatal = `段 ${i} 重试次数用尽（${why}）`;
+          return;
+        }
+      } finally {
+        if (node) dlState.inflight[node] = Math.max(0, (dlState.inflight[node] || 1) - 1);
+        dlState.active.delete(i);
+      }
+    }
+  };
+
+  // ---- worker 池：并发拉不同段；结果按段下标存放，拼装顺序与完成顺序无关 ----
+  let nextSeg = 0;
+  const worker = async () => {
+    while (!dlState.aborted) {
+      const i = nextSeg++;
+      if (i >= totalSegs) return;
+      await fetchOne(i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(workers, totalSegs) }, worker));
+  clearInterval(uiTimer);
+
   document.getElementById("dl-start").disabled = false;
   document.getElementById("dl-pause").disabled = true;
-  if (dlState.aborted) { setDlStatus("已取消"); return; }
-  if (off < dlInfo.size) { setDlStatus("暂停中（可继续）"); return; }
+  document.getElementById("dl-reset").disabled = false;
+  renderNodeContrib();
 
-  // 完整性校验
-  setDlStatus("下载完成，正在校验 sha256 …");
-  const merged = new Uint8Array(parts.reduce((s, b) => s + b.byteLength, 0));
+  if (dlState.aborted && dlState.fatal) {
+    setDlStatus("失败：" + dlState.fatal);
+    toast(dlState.fatal, "bad", 5000);
+    return;
+  }
+  if (dlState.aborted) { setDlStatus("已取消"); return; }
+  if (dlState.completed < totalSegs) { setDlStatus("暂停中（已完成段已保留，可继续）"); return; }
+
+  // ---- 严格按段下标顺序拼装（并行到达顺序不影响最终字节序）----
+  setDlStatus("全部段就绪，按序拼装并校验 sha256 …");
+  const merged = new Uint8Array(dlInfo.size);
   let pos = 0;
-  for (const b of parts) { merged.set(new Uint8Array(b), pos); pos += b.byteLength; }
+  for (let i = 0; i < totalSegs; i++) {
+    const u8 = new Uint8Array(dlState.done[i]);
+    merged.set(u8, pos);
+    pos += u8.length;
+  }
   const hash = await sha256Hex(merged.buffer);
   const okHash = hash === dlInfo.content_hash;
+  const elapsed = (performance.now() - dlState.t0) / 1000;
   dlState.buffer = merged;
-  dlState.partial = false;
-  document.getElementById("dl-save").disabled = false;
+  document.getElementById("dl-save").disabled = !okHash;
   const box = document.getElementById("dl-result");
   box.style.display = "";
   box.innerHTML = `
     <div class="trace-box">
-      <div class="step">${okHash ? "✅" : "❌"} 完整性校验：本地 sha256 ${okHash ? "与服务端一致" : "不一致！"}</div>
-      <div class="step mono small">${esc(hash.slice(0, 48))}…</div>
-      <div class="step">${dlState.segs} 个分段 · 重试 ${dlState.retries} 次 · 副本命中：${
-        Object.entries(dlState.nodeHits).map(([n, c]) => `${n}×${c}`).join(" ")}</div>
+      <div class="step">${okHash ? "✅" : "❌"} 完整性校验：拼装后本地 sha256 ${okHash ? "与原文件完全一致" : "不一致！"}</div>
+      <div class="step mono small">${esc(hash)}${okHash ? "" : `（应为 ${esc(dlInfo.content_hash)}）`}</div>
+      <div class="step">${totalSegs} 段 · ${workers} 路并行 · 耗时 ${elapsed.toFixed(2)}s ·
+        平均吞吐 ${fmtBytes(dlInfo.size / elapsed)}/s · 重试 ${dlState.retries} 次 · 自动换源 ${dlState.failovers} 次</div>
+      <div class="step">节点贡献：${
+        Object.entries(dlState.nodeBytes)
+          .sort((a, b) => b[1] - a[1])
+          .map(([n, b]) => `<span class="mono" style="color:${nodeColor(n)}">${esc(n)} ${fmtBytes(b)}（${(b / dlInfo.size * 100).toFixed(1)}%）</span>`)
+          .join(" · ")}</div>
     </div>`;
-  setDlStatus(okHash ? "下载完成 ✓（校验通过）" : "下载完成但校验失败");
-  toast(okHash ? "下载完成，校验通过" : "校验失败！", okHash ? "ok" : "bad");
+  setDlStatus(okHash ? "并行下载完成 ✓（校验通过，字节序与原文件一致）" : "下载完成但校验失败！");
+  toast(okHash ? "并行下载完成，校验通过" : "校验失败！", okHash ? "ok" : "bad");
 }
 
-function renderNodeHits() {
+// 各节点实时贡献占比（每完成一个段即刷新）
+function renderNodeContrib() {
   const box = document.getElementById("dl-nodes");
-  const hits = dlState?.nodeHits || {};
-  const total = Object.values(hits).reduce((a, b) => a + b, 0) || 1;
-  box.innerHTML = Object.entries(hits).map(([n, c]) => `
-    <span class="badge acc plain" style="margin-right:6px">${esc(n)} ${(c / total * 100).toFixed(0)}%</span>`).join("");
+  const legend = document.getElementById("dl-legend");
+  if (!dlState) { box.innerHTML = ""; legend.style.display = "none"; return; }
+  const total = dlState.bytes || 0;
+  const entries = Object.entries(dlState.nodeBytes);
+  const known = new Set(entries.map(e => e[0]));
+  for (const n of (dlInfo?.nodes || []))
+    if (n.live && !known.has(n.id)) entries.push([n.id, 0]);
+  entries.sort((a, b) => b[1] - a[1]);
+  legend.style.display = entries.length ? "" : "none";
+  legend.innerHTML = entries.map(([n]) =>
+    `<span class="li"><span class="sw" style="background:${nodeColor(n)}"></span>${esc(n)}</span>`).join("");
+  if (!entries.length) { box.innerHTML = `<div class="small muted">等待节点贡献数据…</div>`; return; }
+  box.innerHTML = entries.map(([n, b]) => {
+    const pct = total ? (b / total * 100) : 0;
+    const c = nodeColor(n);
+    const active = dlState.inflight[n] || 0;
+    const fails = dlState.nodeFails[n] || 0;
+    return `
+    <div style="margin-bottom:8px">
+      <div class="small" style="display:flex;justify-content:space-between;gap:8px">
+        <span><b style="color:${c}">${esc(n)}</b>
+          <span class="muted">${fmtBytes(b)} · ${dlState.nodeReqs[n] || 0} 段${active ? ` · ${active} 路拉取中` : ""}${fails ? ` · ${fails} 次失败已换源` : ""}</span></span>
+        <span class="mono">${pct.toFixed(1)}%</span>
+      </div>
+      <div class="pbar thin" style="margin-top:3px"><i style="width:${pct}%;background:${c}"></i></div>
+    </div>`;
+  }).join("");
 }
 
 document.getElementById("dl-save").onclick = () => {

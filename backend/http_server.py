@@ -363,6 +363,8 @@ def api_download(ctx):
         rng = (offset, end) if size else None
     if rng is None and size:
         rng = (0, size - 1)
+    # 并行下载指派的首选副本节点（不可用时 NN 自动故障转移到其它副本）
+    prefer_node = (ctx.query.get("node") or "").strip() or None
     if size == 0:
         ctx.send_bytes(b"", "application/octet-stream", 200,
                        {"X-Content-Hash": ""})
@@ -371,14 +373,18 @@ def api_download(ctx):
         raise ApiError(416, "无效 Range")
     start, end = rng
     data, info = ctx.nn.read_file_range(path, start, end - start + 1,
-                                        ctx.actor())
+                                        ctx.actor(), prefer_node=prefer_node)
     ctx.nn._record_hourly("downloads", 1)
     ctx.nn._record_hourly("bytes_out", len(data))
+    # 逐块归属：[块id@节点:字节数,...]，前端据此渲染段→节点与贡献占比
+    block_map = ",".join(f"{m['bid']}@{m['node']}:{m['bytes']}"
+                         for m in info.get("block_map", []))
     headers = {
         "Content-Range": content_range_value(start, start + len(data) - 1, size),
         "Accept-Ranges": "bytes",
         "X-Served-By": ",".join(info["nodes"]),
         "X-Blocks-Touched": str(info["blocks_touched"]),
+        "X-Block-Map": block_map,
         "Content-Disposition": f'attachment; filename="{os.path.basename(path)}"',
     }
     status = 206 if (start, start + len(data) - 1) != (0, size - 1) else 200
@@ -906,7 +912,7 @@ class NameNodeHandler(BaseHTTPRequestHandler):
                          "Content-Type, Authorization, X-Cluster-Key, Range")
         self.send_header("Access-Control-Expose-Headers",
                          "Content-Range, X-Served-By, X-Blocks-Touched, "
-                         "X-Genstamp, X-Checksum, X-Node-Id")
+                         "X-Block-Map, X-Genstamp, X-Checksum, X-Node-Id")
 
     def _send_json(self, obj, status=200):
         body = json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8")

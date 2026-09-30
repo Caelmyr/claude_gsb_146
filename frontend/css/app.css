@@ -445,6 +445,11 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 .piece.failed { background: var(--bad-soft); border-color: var(--bad); color: var(--bad); }
 @keyframes pulse { from { opacity: .55; } to { opacity: 1; } }
 
+/* 并行下载分段条：active=某节点正在拉取（描边脉冲），retry=该路失败换源中 */
+.dl-seg.active { animation: dl-pulse .7s infinite alternate; }
+.dl-seg.retry { background: var(--warn-soft); border-color: var(--warn); color: var(--warn); }
+@keyframes dl-pulse { from { opacity: .45; transform: scale(.92); } to { opacity: 1; transform: scale(1); } }
+
 .dropzone {
   border: 2px dashed var(--border); border-radius: var(--radius);
   padding: 28px; text-align: center; color: var(--muted); cursor: pointer;

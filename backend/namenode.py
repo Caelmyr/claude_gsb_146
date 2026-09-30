@@ -879,12 +879,15 @@ class NameNode:
         return b"".join(out)
 
     def read_block(self, bid, start=None, end=None, verify=True,
-                   use_cache=True):
+                   use_cache=True, prefer_node=None):
         """
         读一个块：存活好副本轮询，校验失败自动切换下一副本。
+        prefer_node 给定时，若该节点持有本块的存活好副本则把它排在候选首位
+        （并行下载用：把不同段指派给不同副本节点）；该节点不可用时自动回退
+        到其它副本，不影响读取。
         返回 (data, block_meta, served_by)。
         """
-        if use_cache and start is None:
+        if use_cache and start is None and prefer_node is None:
             cached = self.block_cache.get(bid)
             if cached is not None:
                 return cached, self._block_meta(bid), "cache"
@@ -905,6 +908,9 @@ class NameNode:
         self._rr_counter += 1
         order = candidates[self._rr_counter % len(candidates):] + \
             candidates[:self._rr_counter % len(candidates)]
+        # 优先节点置顶（仍保留完整候选列表以便故障转移）
+        if prefer_node and prefer_node in order:
+            order = [prefer_node] + [n for n in order if n != prefer_node]
         errors = []
         for nid in order:
             url = f"{self._node_url(nid).rstrip('/')}/block/{bid}"
@@ -918,7 +924,7 @@ class NameNode:
                     actual = sha256_bytes(data)
                     if actual != blk["checksum"]:
                         raise NNError("校验和不匹配")
-                if start is None and use_cache:
+                if start is None and use_cache and prefer_node is None:
                     self.block_cache.put(bid, data)
                 return data, blk, nid
             except Exception as e:  # noqa: BLE001
@@ -939,10 +945,14 @@ class NameNode:
         blk = self.meta.get("blocks")["blocks"].get(bid)
         return dict(blk) if blk else None
 
-    def read_file_range(self, path, offset=0, length=None, user=None):
+    def read_file_range(self, path, offset=0, length=None, user=None,
+                        prefer_node=None):
         """
         文件级 Range 读：把 [offset, offset+length) 映射到块区间逐块读取。
-        返回 (data, info)。
+        prefer_node：并行下载指派的首选副本节点（每块仍可自动故障转移）。
+        返回 (data, info)，info 额外含：
+          block_map: [{bid, node, bytes}] —— 每个触达块实际由哪个节点、
+                    贡献了多少字节（供前端逐段着色与节点贡献占比统计）。
         """
         with self.meta.lock:
             inode = self.fs.resolve(path)
@@ -952,11 +962,13 @@ class NameNode:
             size = inode.get("size", 0)
         offset = max(0, min(offset, size))
         end = size - 1 if length is None else min(size - 1, offset + length - 1)
+        empty_info = {"size": size, "start": offset, "end": offset,
+                      "nodes": [], "blocks_touched": 0, "block_map": []}
         if size == 0 or offset > end:
-            return b"", {"size": size, "start": offset, "end": offset,
-                         "nodes": [], "blocks_touched": 0}
+            return b"", empty_info
         out = []
         nodes = []
+        block_map = []
         touched = 0
         pos = offset
         # 逐块定位
@@ -976,16 +988,19 @@ class NameNode:
             e = min(end, bend) - bstart
             full = (s == 0 and e == bsize - 1)
             data, _blk, node = self.read_block(
-                bid, None if full else s, None if full else e)
+                bid, None if full else s, None if full else e,
+                prefer_node=prefer_node)
             out.append(data)
             nodes.append(node)
+            block_map.append({"bid": bid, "node": node, "bytes": len(data)})
             touched += 1
         data = b"".join(out)
         # 热度记录
         self.record_access(path, "download", user, len(data),
                            nodes[0] if nodes else None)
         return data, {"size": size, "start": pos, "end": end,
-                      "nodes": sorted(set(nodes)), "blocks_touched": touched}
+                      "nodes": sorted(set(nodes)), "blocks_touched": touched,
+                      "block_map": block_map}
 
     # ==================================================================
     # 上传会话（分块上传 + 断点续传）
@@ -1152,16 +1167,46 @@ class NameNode:
             inode = self.fs.resolve(path)
             if inode["type"] != "file":
                 raise FsError(f"不是文件: {path}")
-            blk_metas = [self._block_meta(b) for b in inode.get("block_ids", [])]
+            block_ids = list(inode.get("block_ids", []))
+            blk_metas = [self._block_meta(b) for b in block_ids]
+            live_ids = {n["node_id"] for n in self.live_nodes()}
+        # 逐块给出文件内偏移、完整校验和与每个副本的存活/健康状态，
+        # 供并行下载调度（段→节点指派、故障转移与完整性校验）。
+        blocks = []
+        acc = 0
+        for b in blk_metas:
+            if not b:
+                continue
+            reps = b.get("replicas", {}) or {}
+            replicas = []
+            for nid, r in reps.items():
+                alive = nid in live_ids
+                replicas.append({
+                    "node": nid,
+                    "state": r.get("state", "ok"),
+                    "live": alive,
+                    "usable": alive and r.get("state") == "ok"
+                              and r.get("genstamp", 0) == b.get("genstamp", 0),
+                })
+            blocks.append({"id": b["id"], "offset": acc, "size": b["size"],
+                           "checksum": b["checksum"],
+                           "checksum16": b["checksum"][:16],
+                           "genstamp": b["genstamp"],
+                           "replicas": sorted(r["node"] for r in replicas
+                                              if r["usable"]),
+                           "replica_detail": sorted(replicas,
+                                                    key=lambda x: x["node"])})
+            acc += b["size"]
+        # 出现过的全部节点（含当前不存活者），便于前端着色与展示
+        node_ids = sorted({r["node"] for b in blocks for r in b["replica_detail"]})
+        nodes = [{"id": nid, "live": nid in live_ids} for nid in node_ids]
         return {
             "path": path, "name": inode["name"], "size": inode.get("size", 0),
             "content_hash": inode.get("content_hash"),
+            "block_size": config.BLOCK_SIZE,
             "mime": inode.get("mime"),
-            "blocks": [{"id": b["id"], "size": b["size"],
-                        "checksum": b["checksum"][:16],
-                        "genstamp": b["genstamp"],
-                        "replicas": sorted(b.get("replicas", {}).keys())}
-                       for b in blk_metas if b],
+            "blocks": blocks,
+            "nodes": nodes,
         }
 
     def preview_file(self, path):
