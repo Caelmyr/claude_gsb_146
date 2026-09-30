@@ -118,6 +118,7 @@ UPLOAD_FLAKY_RATE = 0.0                 # 服务端模拟随机失败概率（�
 UPLOAD_FLAKY_RATE_CHAOS = 0.35
 
 DOWNLOAD_RANGE_DEFAULT = 512 * 1024     # 前端默认下载分段大小
+DOWNLOAD_WORKERS_MAX = 8                # 前端允许的最大并发路数
 PREVIEW_MAX_BYTES = 256 * 1024          # 文本预览上限
 THUMB_MAX_BYTES = 2 * 1024 * 1024       # 缩略图读取上限（图片文件）
 MERGE_MAX_TEXT_BYTES = 8 * 1024 * 1024  # 参与三方文本合并的单文件上限

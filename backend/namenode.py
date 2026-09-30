@@ -879,12 +879,16 @@ class NameNode:
         return b"".join(out)
 
     def read_block(self, bid, start=None, end=None, verify=True,
-                   use_cache=True):
+                   use_cache=True, prefer=None):
         """
         读一个块：存活好副本轮询，校验失败自动切换下一副本。
+        prefer 指定优先副本节点（并行下载调度用）：该节点持有存活好副本时
+        固定首选；其不可用（死亡/无此副本/损坏）时自动回退轮询其它副本。
         返回 (data, block_meta, served_by)。
         """
-        if use_cache and start is None:
+        # 固定副本的并行读不走缓存，保证字节真实来自指定 DataNode，
+        # 也避免缓存命中导致节点贡献统计失真。
+        if use_cache and start is None and not prefer:
             cached = self.block_cache.get(bid)
             if cached is not None:
                 return cached, self._block_meta(bid), "cache"
@@ -901,10 +905,14 @@ class NameNode:
         if not candidates:
             raise MissingBlockError(
                 f"块 {bid} 无可用副本（missing），文件暂不可读")
-        # 轮询起点
-        self._rr_counter += 1
-        order = candidates[self._rr_counter % len(candidates):] + \
-            candidates[:self._rr_counter % len(candidates)]
+        if prefer and prefer in candidates:
+            # 调度器指定的副本优先；失败后仍按轮询顺序尝试其余副本
+            order = [prefer] + [n for n in candidates if n != prefer]
+        else:
+            # 轮询起点
+            self._rr_counter += 1
+            k = self._rr_counter % len(candidates)
+            order = candidates[k:] + candidates[:k]
         errors = []
         for nid in order:
             url = f"{self._node_url(nid).rstrip('/')}/block/{bid}"
@@ -918,7 +926,7 @@ class NameNode:
                     actual = sha256_bytes(data)
                     if actual != blk["checksum"]:
                         raise NNError("校验和不匹配")
-                if start is None and use_cache:
+                if start is None and use_cache and not prefer:
                     self.block_cache.put(bid, data)
                 return data, blk, nid
             except Exception as e:  # noqa: BLE001
@@ -939,10 +947,12 @@ class NameNode:
         blk = self.meta.get("blocks")["blocks"].get(bid)
         return dict(blk) if blk else None
 
-    def read_file_range(self, path, offset=0, length=None, user=None):
+    def read_file_range(self, path, offset=0, length=None, user=None,
+                        prefer=None):
         """
         文件级 Range 读：把 [offset, offset+length) 映射到块区间逐块读取。
-        返回 (data, info)。
+        prefer 指定首选副本节点（并行下载调度用）。
+        返回 (data, info)；info 含每个副本节点实际贡献的字节数 node_bytes。
         """
         with self.meta.lock:
             inode = self.fs.resolve(path)
@@ -954,10 +964,14 @@ class NameNode:
         end = size - 1 if length is None else min(size - 1, offset + length - 1)
         if size == 0 or offset > end:
             return b"", {"size": size, "start": offset, "end": offset,
-                         "nodes": [], "blocks_touched": 0}
+                         "nodes": [], "blocks_touched": 0,
+                         "node_bytes": {}, "preferred": prefer or "",
+                         "failed_over": False}
         out = []
         nodes = []
+        node_bytes = {}
         touched = 0
+        failover = False
         pos = offset
         # 逐块定位
         block_starts = []
@@ -976,16 +990,22 @@ class NameNode:
             e = min(end, bend) - bstart
             full = (s == 0 and e == bsize - 1)
             data, _blk, node = self.read_block(
-                bid, None if full else s, None if full else e)
+                bid, None if full else s, None if full else e,
+                prefer=prefer)
             out.append(data)
             nodes.append(node)
+            node_bytes[node] = node_bytes.get(node, 0) + len(data)
+            if prefer and node != prefer:
+                failover = True
             touched += 1
         data = b"".join(out)
         # 热度记录
         self.record_access(path, "download", user, len(data),
                            nodes[0] if nodes else None)
         return data, {"size": size, "start": pos, "end": end,
-                      "nodes": sorted(set(nodes)), "blocks_touched": touched}
+                      "nodes": sorted(set(nodes)), "blocks_touched": touched,
+                      "node_bytes": node_bytes, "preferred": prefer or "",
+                      "failed_over": failover}
 
     # ==================================================================
     # 上传会话（分块上传 + 断点续传）
@@ -1153,15 +1173,38 @@ class NameNode:
             if inode["type"] != "file":
                 raise FsError(f"不是文件: {path}")
             blk_metas = [self._block_meta(b) for b in inode.get("block_ids", [])]
+        live_ids = {n["node_id"] for n in self.live_nodes()}
+        blocks = []
+        offset = 0
+        for b in blk_metas:
+            if not b:
+                continue
+            replicas = []
+            for nid, rep in sorted((b.get("replicas") or {}).items()):
+                replicas.append({
+                    "node": nid,
+                    "state": rep.get("state", "ok"),
+                    "live": nid in live_ids,
+                    "genstamp": rep.get("genstamp", 0),
+                    "readable": nid in live_ids and rep.get("state") == "ok"
+                                 and rep.get("genstamp", 0) == b.get("genstamp", 0),
+                })
+            blocks.append({"id": b["id"], "offset": offset,
+                           "size": b["size"],
+                           "checksum": b["checksum"][:16],
+                           "checksum_full": b["checksum"],
+                           "genstamp": b["genstamp"],
+                           "replicas": [r["node"] for r in replicas],
+                           "replica_detail": replicas})
+            offset += b["size"]
         return {
             "path": path, "name": inode["name"], "size": inode.get("size", 0),
             "content_hash": inode.get("content_hash"),
+            "content_hash_full": inode.get("content_hash"),
             "mime": inode.get("mime"),
-            "blocks": [{"id": b["id"], "size": b["size"],
-                        "checksum": b["checksum"][:16],
-                        "genstamp": b["genstamp"],
-                        "replicas": sorted(b.get("replicas", {}).keys())}
-                       for b in blk_metas if b],
+            "live_nodes": sorted(live_ids),
+            "max_workers": config.DOWNLOAD_WORKERS_MAX,
+            "blocks": blocks,
         }
 
     def preview_file(self, path):

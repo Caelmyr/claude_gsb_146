@@ -370,14 +370,23 @@ def api_download(ctx):
     if rng is None:
         raise ApiError(416, "无效 Range")
     start, end = rng
+    prefer = (ctx.query.get("node") or "").strip() or None
     data, info = ctx.nn.read_file_range(path, start, end - start + 1,
-                                        ctx.actor())
+                                        ctx.actor(), prefer=prefer)
     ctx.nn._record_hourly("downloads", 1)
     ctx.nn._record_hourly("bytes_out", len(data))
+    node_bytes = info.get("node_bytes", {})
     headers = {
         "Content-Range": content_range_value(start, start + len(data) - 1, size),
         "Accept-Ranges": "bytes",
         "X-Served-By": ",".join(info["nodes"]),
+        "X-Served-Node": (info["nodes"][0] if len(info["nodes"]) == 1
+                          else ",".join(info["nodes"])),
+        # 各副本节点对本次请求实际贡献的字节（node:bytes, 分号分隔）
+        "X-Node-Bytes": ";".join(f"{n}:{b}" for n, b
+                                 in sorted(node_bytes.items())),
+        "X-Preferred-Node": prefer or "",
+        "X-Failover": "1" if info.get("failed_over") else "0",
         "X-Blocks-Touched": str(info["blocks_touched"]),
         "Content-Disposition": f'attachment; filename="{os.path.basename(path)}"',
     }
@@ -905,8 +914,9 @@ class NameNodeHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers",
                          "Content-Type, Authorization, X-Cluster-Key, Range")
         self.send_header("Access-Control-Expose-Headers",
-                         "Content-Range, X-Served-By, X-Blocks-Touched, "
-                         "X-Genstamp, X-Checksum, X-Node-Id")
+                         "Content-Range, X-Served-By, X-Served-Node, "
+                         "X-Node-Bytes, X-Preferred-Node, X-Failover, "
+                         "X-Blocks-Touched, X-Genstamp, X-Checksum, X-Node-Id")
 
     def _send_json(self, obj, status=200):
         body = json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8")

@@ -49,7 +49,7 @@ python3 -m backend.datanode --id dn5 --port 8025
 |---|---|---|
 | 仪表盘 | `index.html` | KPI / 容量水位 / 最近提交 / 事件流 / 热点 TOP |
 | 文件浏览 | `files.html` | 目录树 + 缩略图网格 + 面包屑 + 块/副本详情抽屉 + 文本预览 |
-| 上传下载 | `transfer.html` | 分块上传（分片可视化、暂停/续传/混沌模式）、Range 分段下载（断点续传、sha256 校验、副本命中统计） |
+| 上传下载 | `transfer.html` | 分块上传（分片可视化、暂停/续传/混沌模式）、**多副本并行 Range 分段下载**（多路绑定不同节点、各节点实时贡献占比/字节、分段来源着色、任一副本失败自动换节点补齐、断点续传、拼装 sha256 校验） |
 | 版本历史 | `versions.html` | 提交时间线（泳道）、分支管理、提交/合并/检出、冲突展示、文件级历史与回滚 |
 | 差异对比 | `diff.html` | 版本 diff + 文本 diff 双模式、Myers/Patience/difflib 选择、unified/双栏视图、行内字符级高亮、大文件性能试验台 |
 | 节点状态 | `nodes.html` | 节点卡片（心跳/容量/IO/版本向量）、块×节点副本矩阵、恢复队列、杀死/复活/注入损坏演练、实时事件流 |
@@ -76,7 +76,8 @@ python3 -m backend.datanode --id dn5 --port 8025
 │   · 元数据 9 个 JSON 文档：fs/blocks/versions/users/perms/                │
 │     logs/recycle/stats/cluster   —— 原子写 + 版本向量                     │
 │   · 块表（genstamp/校验和/副本位置）、放置策略、恢复调度、GC                │
-│   · 上传会话（断点续传暂存）、Range 读路径（副本轮询+故障转移）              │
+│   · 上传会话（断点续传暂存）、Range 读路径（副本轮询+故障转移，             │
+│     /api/download?node= 可固定副本，供多节点并行分段下载）                  │
 │   · 版本树 VersionStore（提交/分支/merge/checkout）                        │
 └──────┬───────────────────────────────────────────────────▲───────────────┘
        │ PUT /block（流水线复制 X-Forward-To）   心跳/块汇报/事件（JSON）
@@ -126,6 +127,26 @@ data/datanodes/<node_id>/doc_cache/*.json   # DN 同步到的元数据文档
 * **静默损坏**：DN scrub 线程抽样重算校验和；读路径 NN 侧二次校验 +
   副本故障转移；注入演练见 `POST /api/sim/corrupt`。
 
+#### 4.2.1 大文件多副本并行分段下载（`transfer.html`）
+* **真并行**：前端把文件切成等长分段，N 路 worker 各自**绑定不同的存活副本
+  节点**（分段按其覆盖块的可读副本轮转预分配 + 任务窃取），同时发 Range
+  请求；请求带 `node=<dn>`，NameNode `read_block(prefer=…)` 固定首选该
+  DataNode，多路流量真正分散到多节点，明显缩短大文件下载时间。
+* **双层自动故障转移**：客户端首选节点请求失败（节点被杀 / 连接拒绝 /
+  超时 / 混沌中断）时，在同一段内立即按候选副本顺序换节点重试；即使首选
+  节点在 NN 看来存活、但其副本在 NN 内部读取时损坏/失败，NN 也会自动转到
+  下一存活好副本（响应头 `X-Failover: 1`）。一路失败不影响整体进度。
+* **实时贡献可视化**：响应头 `X-Node-Bytes: dn1:65536;dn3:65536` 给出本次
+  请求每个节点真实服务的字节数（分段跨块时可能由多节点拼成）；前端每完成
+  一段就动态刷新**各节点累计字节/占比条/分段数**，并以节点专属颜色渲染
+  **分段来源网格**（悬停可见每段字节区间与服务节点）、记录故障转移流水。
+* **顺序不乱 + 完整性**：分段结果按**段号索引**落位（与完成先后无关），
+  下载结束按序拼接，本地整文件 sha256 与 `download_info` 的 content_hash
+  逐位比对通过才允许保存；DN 对整块做 sha256 校验、NN 全块读二次校验兜底。
+* **暂停/续传/超时保护**：暂停后已完成分段保留在内存，点继续只拉缺口
+  （分段大小或文件变化则安全重开）；单段请求 12s 超时，防止挂起节点把
+  某一路永久卡死；下载中每 2s 刷新存活拓扑，中途死亡节点即时移出候选。
+
 ### 4.3 版本树冲突合并
 * 提交 = 全量快照 + 块引用（块不可变 ⇒ 历史版本天然可读；
   GC 保护集 = 活动 inode ∪ 全部提交快照）。
@@ -168,7 +189,7 @@ POST /api/auth/login|logout      GET /api/auth/me|sessions
 GET  /api/fs/tree|list|stat      POST /api/fs/mkdir|rename|move|delete
 GET  /api/thumbnail|file/preview|file/blocks
 POST /api/upload/begin|chunk|complete      GET /api/upload/status|sessions
-GET  /api/download/info|download(Range)
+GET  /api/download/info|download(Range, ?node= 固定副本，响应 X-Node-Bytes/X-Failover)
 GET  /api/version/branches|commits|graph|diff|working_diff|file_at|history|stats
 POST /api/version/commit|branch|branch_delete|checkout|merge|restore|diff_text
 GET  /api/nodes|nodes/blocks|nodes/matrix|nodes/block_paths

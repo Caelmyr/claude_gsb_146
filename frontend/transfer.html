@@ -76,7 +76,7 @@
 
         <!-- ================= 下载 ================= -->
         <div class="card">
-          <div class="card-title">⇩ 分段下载 <span class="hint">HTTP Range 分段拉取 · 副本轮询与故障转移</span></div>
+          <div class="card-title">⇩ 多副本并行分段下载 <span class="hint">多节点同时拉不同分段 · 任一副本失败自动换节点 · 顺序拼装 + sha256 校验</span></div>
 
           <div class="form-row" style="margin-bottom:12px">
             <label class="fl" style="flex:1">文件路径
@@ -90,13 +90,23 @@
                 <option value="1048576">1 MiB</option>
               </select>
             </label>
+            <label class="fl" title="同时从不同副本节点拉取的路数（每路尽量绑定不同节点）">并发路数
+              <select id="dl-workers">
+                <option value="1">1（顺序）</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+                <option value="4" selected>4</option>
+                <option value="6">6</option>
+                <option value="8">8</option>
+              </select>
+            </label>
             <button class="btn" id="dl-pick">浏览…</button>
           </div>
 
           <div id="dl-info" class="small muted" style="margin-bottom:10px">输入路径后点「查询」</div>
           <div class="btn-group" style="margin-bottom:12px">
             <button class="btn" id="dl-query">查询</button>
-            <button class="btn primary" id="dl-start" disabled>开始下载</button>
+            <button class="btn primary" id="dl-start" disabled>开始并行下载</button>
             <button class="btn" id="dl-pause" disabled>暂停</button>
             <button class="btn ok" id="dl-save" disabled>保存到本地</button>
           </div>
@@ -107,7 +117,17 @@
           </div>
           <div class="small muted" id="dl-status">就绪</div>
 
-          <div id="dl-nodes" class="small" style="margin-top:10px"></div>
+          <!-- 各节点实时贡献（下载中动态更新） -->
+          <div id="dl-contrib" style="margin-top:12px"></div>
+          <!-- 分段来源网格：颜色=最终服务该段的节点 -->
+          <div id="dl-segwrap" style="margin-top:10px;display:none">
+            <div class="small muted" style="margin-bottom:4px">分段来源（颜色对应上方节点，悬停看详情）</div>
+            <div class="piece-grid" id="dl-segs"></div>
+          </div>
+          <div id="dl-failwrap" style="margin-top:10px;display:none">
+            <div class="small muted" style="margin-bottom:4px">故障转移记录 <span id="dl-failcount" class="badge warn plain" style="margin-left:4px">0</span></div>
+            <div id="dl-faillog" class="trace-box small" style="max-height:120px;overflow:auto"></div>
+          </div>
           <div id="dl-result" style="display:none;margin-top:12px"></div>
         </div>
       </div>
@@ -348,22 +368,51 @@ function bufToB64(buf) {
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// 单段请求超时：避免某副本节点挂起（非快速失败）时一路永久卡死，
+// 超时与混沌中断一样算作该路失败 -> 自动改用其它副本节点补齐。
+const SEGMENT_TIMEOUT_MS = 12000;
+
 // ------------------------------------------------------------------ 下载
 let dlInfo = null;
-let dlState = null;   // {paused, aborted, chunks:[], offset}
+let dlState = null;   // 并行下载状态机，见 startDownload 内初始化
+
+// 节点配色：同一节点在贡献面板/分段网格中始终同色
+const NODE_COLORS = ["#4f8cff", "#2fbf71", "#f0a538", "#e5534b",
+                     "#9b6cff", "#39bcd0", "#ff7eb6", "#7ee787"];
+const NODE_FALLBACK_COLOR = "#6f7890";
+const nodeColor = new Map();
+function colorFor(node) {
+  if (!node) return NODE_FALLBACK_COLOR;
+  if (!nodeColor.has(node))
+    nodeColor.set(node, NODE_COLORS[nodeColor.size % NODE_COLORS.length]);
+  return nodeColor.get(node);
+}
 
 document.getElementById("dl-query").onclick = async () => {
   const path = document.getElementById("dl-path").value.trim();
   if (!path) return toast("请输入文件路径", "warn");
   try {
     dlInfo = await api("GET", "/api/download/info?path=" + encodeURIComponent(path));
+    nodeColor.clear();
+    (dlInfo.live_nodes || []).forEach(colorFor);
+    const live = dlInfo.live_nodes || [];
     document.getElementById("dl-info").innerHTML = `
       <b>${esc(dlInfo.name)}</b> · ${fmtBytes(dlInfo.size)} · ${esc(dlInfo.mime)} ·
-      ${dlInfo.blocks.length} 块 · sha256 <span class="mono">${esc(dlInfo.content_hash.slice(0, 20))}…</span>
+      ${dlInfo.blocks.length} 块 · 在线副本节点 <span class="mono">${esc(live.join(", ") || "无")}</span> ·
+      sha256 <span class="mono">${esc((dlInfo.content_hash_full || dlInfo.content_hash || "").slice(0, 20))}…</span>
       <div class="small" style="margin-top:4px">副本分布：${dlInfo.blocks.map(b =>
         `<span class="chip" title="${esc(b.id)}">${esc(b.checksum.slice(0, 6))}→[${esc(b.replicas.join(","))}]</span>`).join(" ")}</div>`;
+    // 并发路数默认取「有副本的存活节点数」与选项的较小值，保证多路真来自不同节点
+    if (live.length) {
+      const sel = document.getElementById("dl-workers");
+      const want = Math.max(1, Math.min(live.length, 4));
+      sel.value = String(want);
+    }
     document.getElementById("dl-start").disabled = dlInfo.size === 0;
     document.getElementById("dl-result").style.display = "none";
+    document.getElementById("dl-contrib").innerHTML = "";
+    document.getElementById("dl-segwrap").style.display = "none";
+    document.getElementById("dl-failwrap").style.display = "none";
   } catch (e) {
     dlInfo = null;
     document.getElementById("dl-info").textContent = "查询失败：" + e.message;
@@ -400,7 +449,7 @@ document.getElementById("dl-pause").onclick = () => {
   if (!dlState) return;
   dlState.paused = !dlState.paused;
   document.getElementById("dl-pause").textContent = dlState.paused ? "继续" : "暂停";
-  setDlStatus(dlState.paused ? "已暂停（记住偏移量，可断点续传）" : "继续下载…");
+  setDlStatus(dlState.paused ? "已暂停（已完成分段保留在内存，可继续）" : "继续下载…");
 };
 
 function setDlStatus(t) { document.getElementById("dl-status").textContent = t; }
@@ -409,89 +458,457 @@ function setDlPct(p) {
   document.getElementById("dl-pct").textContent = p.toFixed(1) + "%";
 }
 
+// 查询某一文件字节区间落在哪些块上、哪些存活好副本可读 -> 候选节点集合。
+// topology 为可选的实时存活节点快照（下载中周期性刷新），用于剔除刚故障的节点。
+function nodesForRange(info, segStart, segEnd, topology) {
+  const set = new Set();
+  for (const b of info.blocks) {
+    const bEnd = b.offset + b.size - 1;
+    if (bEnd < segStart || b.offset > segEnd) continue;
+    for (const r of (b.replica_detail || [])) {
+      if (!r.readable) continue;
+      if (topology && !topology.has(r.node)) continue;
+      set.add(r.node);
+    }
+  }
+  return [...set];
+}
+
+/**
+ * 拉取一个分段（含自动故障转移重试）。
+ * 每轮让 NN 优先走 prefer 节点；该路失败（节点被杀/块损坏/混沌中断）时
+ * 自动换候选清单中的其它节点补齐；所有节点都失败则抛出，由调度器重排队。
+ * 返回 { buf, nodeBytes:Map, attempts:[{node,ok,err,failover}] }
+ */
+async function fetchSegment(path, seg, candidates, chaosSignal = null) {
+  const attempts = [];
+  let lastErr = null;
+  for (let round = 0; round < Math.max(2, candidates.length + 1); round++) {
+    const prefer = candidates[round % candidates.length];
+    // 每次尝试独立的控制器：上一次超时/中断不能影响故障转移到下一节点
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), SEGMENT_TIMEOUT_MS);
+    // 混沌信号只作用于首跳；若它先触发则让本次 fetch 立即失败
+    const onChaos = () => ctrl.abort();
+    if (round === 0 && chaosSignal) {
+      if (chaosSignal.aborted) ctrl.abort();
+      else chaosSignal.addEventListener("abort", onChaos, { once: true });
+    }
+    try {
+      const url = `/api/download?path=${encodeURIComponent(path)}`
+        + `&offset=${seg.start}&length=${seg.len}&node=${encodeURIComponent(prefer)}`;
+      const resp = await fetch(url, {
+        headers: { Authorization: "Bearer " + getToken() },
+        signal: ctrl.signal,
+      });
+      if (!resp.ok && resp.status !== 206) throw new Error("HTTP " + resp.status);
+      const buf = await resp.arrayBuffer();
+      if (buf.byteLength !== seg.len) throw new Error(`长度不符 ${buf.byteLength}/${seg.len}`);
+      // 真实贡献以服务端 X-Node-Bytes 为准（分段跨界时可能由多节点拼成）
+      const nodeBytes = new Map();
+      (resp.headers.get("X-Node-Bytes") || "").split(";").filter(Boolean)
+        .forEach(pair => {
+          const [n, bytes] = pair.split(":");
+          nodeBytes.set(n, (nodeBytes.get(n) || 0) + (+bytes || 0));
+        });
+      const failedOver = resp.headers.get("X-Failover") === "1";
+      const servedBy = [...nodeBytes.keys()];
+      attempts.push({ node: prefer, servedBy, ok: true, failover: failedOver });
+      return { buf, nodeBytes, servedBy, attempts };
+    } catch (e) {
+      lastErr = e;
+      const reason = e.name === "AbortError" ? "请求超时/中断" : e.message;
+      attempts.push({ node: prefer, ok: false, err: reason });
+    } finally {
+      clearTimeout(timer);
+      if (round === 0 && chaosSignal)
+        chaosSignal.removeEventListener("abort", onChaos);
+    }
+  }
+  const err = new Error(`分段 ${seg.index} 全部副本尝试失败：${lastErr?.message || lastErr}`);
+  err.attempts = attempts;
+  throw err;
+}
+
+function buildSegments(size, segSize) {
+  const total = Math.max(1, Math.ceil(size / segSize));
+  const segs = [];
+  for (let i = 0; i < total; i++) {
+    const start = i * segSize;
+    segs.push({ index: i, start, len: Math.min(segSize, size - start) });
+  }
+  return segs;
+}
+
+function renderSegGrid(state) {
+  const box = document.getElementById("dl-segs");
+  const shown = Math.min(state.segments.length, 240);
+  let html = "";
+  for (let i = 0; i < shown; i++) {
+    const r = state.results[i];
+    const seg = state.segments[i];
+    let cls = "", style = "", title = `分段 ${i} @${fmtBytes(seg.start)}-${fmtBytes(seg.start + seg.len - 1)}`;
+    if (r && r.ok) {
+      const nodes = [...r.nodeBytes.keys()];
+      const main = nodes.sort((a, b) => r.nodeBytes.get(b) - r.nodeBytes.get(a))[0];
+      const c = colorFor(main);
+      cls = "done";
+      style = `background:${hexA(c, .28)};border-color:${c};color:${c}`;
+      title += "\n来自 " + nodes.map(n => `${n}:${fmtBytes(r.nodeBytes.get(n))}`).join(" ");
+      if (r.failedOver) title += "\n（发生故障转移）";
+    } else if (state.inflight.has(i)) {
+      cls = "sending";
+      const node = state.inflight.get(i);
+      if (node) { const c = colorFor(node); style = `border-color:${c};color:${c}`; }
+      title += `\n拉取中… 首选 ${node || "?"}`;
+    } else if (r && r.error) {
+      cls = "failed";
+      title += "\n失败：" + r.error;
+    }
+    html += `<span class="piece ${cls}" style="${style}" title="${esc(title)}">${i}</span>`;
+  }
+  if (state.segments.length > shown)
+    html += `<span class="piece" title="…">+${state.segments.length - shown}</span>`;
+  box.innerHTML = html;
+}
+
+function hexA(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+}
+
+// 各节点实时贡献：下载过程中随分段完成持续刷新（字节数 + 占比条 + 分段数）
+function renderContrib(state) {
+  const box = document.getElementById("dl-contrib");
+  const bytesByNode = state.bytesByNode;
+  const segsByNode = state.segsByNode;
+  const inflightByNode = state.inflightByNode;
+  const total = state.doneBytes || 1;
+  const nodes = [...new Set([
+    ...Object.keys(bytesByNode), ...Object.keys(inflightByNode),
+  ])].sort();
+  if (!nodes.length) {
+    box.innerHTML = `<div class="small muted">等待各节点开始贡献数据 …</div>`;
+    return;
+  }
+  box.innerHTML = nodes.map(n => {
+    const bytes = bytesByNode[n] || 0;
+    const segs = segsByNode[n] || 0;
+    const flying = inflightByNode[n] || 0;
+    const pct = bytes / total * 100;
+    const c = colorFor(n);
+    return `
+    <div style="margin-bottom:7px">
+      <div class="small" style="display:flex;justify-content:space-between;margin-bottom:2px">
+        <span><span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${c};margin-right:6px"></span><b class="mono">${esc(n)}</b>
+          <span class="muted">· ${fmtBytes(bytes)} · ${pct.toFixed(1)}% · ${segs} 段${flying ? ` · 拉取中 ${flying}` : ""}</span></span>
+        <span class="mono muted">${pct.toFixed(1)}%</span>
+      </div>
+      <div class="pbar thin"><i style="width:${pct.toFixed(2)}%;background:${c}"></i></div>
+    </div>`;
+  }).join("");
+}
+
+function addFailLog(state, segIndex, prefer, err, recoveredNode) {
+  state.failovers.push({ segIndex, prefer, err, recoveredNode });
+  document.getElementById("dl-failcount").textContent = state.failovers.length;
+  const wrap = document.getElementById("dl-failwrap");
+  wrap.style.display = "";
+  const log = document.getElementById("dl-faillog");
+  const div = document.createElement("div");
+  div.className = "step";
+  div.style.padding = "2px 0";
+  div.innerHTML = recoveredNode
+    ? `段 #${segIndex}：<b>${esc(prefer)}</b> 失败（${esc(err)}）→ 自动改用 <b style="color:${colorFor(recoveredNode)}">${esc(recoveredNode)}</b> 补齐 ✓`
+    : `段 #${segIndex}：<b>${esc(prefer)}</b> 失败（${esc(err)}），重新排队`;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
 async function startDownload() {
   if (!dlInfo) return;
-  const seg = +document.getElementById("dl-seg").value;
+  const seg = Math.max(1, +document.getElementById("dl-seg").value || 131072);
+  const workers = Math.max(1, Math.min(
+    +document.getElementById("dl-workers").value || 4, dlInfo.max_workers || 8));
   const path = dlInfo.path || document.getElementById("dl-path").value.trim();
-  const from = dlState && dlState.partial && dlState.path === path ? dlState.offset : 0;
-  const parts = dlState && dlState.partial && dlState.path === path ? dlState.chunks : [];
-  dlState = { paused: false, aborted: false, chunks: parts, offset: from,
-              path, nodeHits: dlState?.nodeHits || {}, segs: 0, retries: 0, partial: true };
+
+  // 暂停后继续：复用已完成的分段结果（按段号索引，顺序天然不乱）。
+  // 分段大小/文件变了则旧结果作废，按全新任务开始，避免段表错位与越界。
+  const resume = !!(dlState && dlState.partial && dlState.path === path
+                    && dlState.segSize === seg && dlState.fileSize === dlInfo.size);
+  const segments = buildSegments(dlInfo.size, seg);
+  const results = (resume && dlState.results.length === segments.length)
+    ? dlState.results : new Array(segments.length).fill(null);
+  const doneSet = new Set();
+  let doneBytes = 0;
+  results.forEach((r, i) => {
+    if (r && r.ok) { doneSet.add(i); doneBytes += r.buf.byteLength; }
+  });
+
+  dlState = {
+    path, partial: true, paused: false, aborted: false, finished: false,
+    segSize: seg, fileSize: dlInfo.size,
+    segments, results, doneSet, doneBytes,
+    inflight: new Map(),          // segIndex -> 当前首选节点
+    inflightByNode: {},           // node -> 在途段数（调度负载）
+    bytesByNode: resume ? dlState.bytesByNode : {},
+    segsByNode: resume ? dlState.segsByNode : {},
+    failovers: resume ? dlState.failovers : [],
+    nextSeg: 0, workers, retries: resume ? dlState.retries || 0 : 0,
+  };
+
   document.getElementById("dl-start").disabled = true;
   document.getElementById("dl-pause").disabled = false;
   document.getElementById("dl-save").disabled = true;
   document.getElementById("dl-pause").textContent = "暂停";
-  if (from > 0) setDlStatus(`断点续传：从 ${fmtBytes(from)} 处继续`);
+  document.getElementById("dl-segwrap").style.display = "";
+  if (dlState.failovers.length) document.getElementById("dl-failwrap").style.display = "";
+  document.getElementById("dl-faillog").innerHTML = "";
+  if (resume) {
+    dlState.failovers.forEach(f => {
+      const log = document.getElementById("dl-faillog");
+      const div = document.createElement("div");
+      div.className = "step"; div.style.padding = "2px 0";
+      div.innerHTML = f.recoveredNode
+        ? `段 #${f.segIndex}：<b>${esc(f.prefer)}</b> 失败（${esc(f.err)}）→ <b>${esc(f.recoveredNode)}</b> 补齐 ✓`
+        : `段 #${f.segIndex}：<b>${esc(f.prefer)}</b> 失败（${esc(f.err)}）`;
+      log.appendChild(div);
+    });
+  }
+  setDlPct(doneBytes / dlInfo.size * 100);
+  renderContrib(dlState);
+  renderSegGrid(dlState);
 
   const t0 = performance.now();
-  let off = from;
-  while (off < dlInfo.size) {
-    if (dlState.aborted) break;
-    while (dlState.paused) await sleep(250);
-    const len = Math.min(seg, dlInfo.size - off);
-    const ctrl = new AbortController();
-    let chaosTimer = null;
-    try {
-      if (CHAOS() && Math.random() < 0.22) {
-        chaosTimer = setTimeout(() => ctrl.abort(), 40 + Math.random() * 200);
+
+  // 实时存活拓扑：下载中周期刷新，某节点中途死亡后立即从候选与首选中剔除
+  let liveTopology = new Set(dlInfo.live_nodes || []);
+  let topologyUpdating = null;
+  async function refreshTopology() {
+    if (topologyUpdating) return topologyUpdating;
+    topologyUpdating = (async () => {
+      try {
+        const view = await api("GET", "/api/nodes");
+        const live = new Set((view.nodes || [])
+          .filter(n => n.state === "LIVE").map(n => n.node_id));
+        if (live.size) liveTopology = live;
+        dlInfo.live_nodes = [...live];
+      } catch (e) { /* 刷新失败沿用上次拓扑 */ }
+    })().finally(() => { topologyUpdating = null; });
+    return topologyUpdating;
+  }
+  const topologyTimer = setInterval(refreshTopology, 2000);
+
+  // 稳定地把 worker 路绑定到不同的存活副本节点（按持有副本数降序）
+  const replicaCount = {};
+  dlInfo.blocks.forEach(b => b.replicas.forEach(n =>
+    replicaCount[n] = (replicaCount[n] || 0) + 1));
+  const allNodes = (dlInfo.live_nodes || [])
+    .slice()
+    .sort((a, b) => (replicaCount[b] || 0) - (replicaCount[a] || 0));
+  const workerNodes = allNodes.slice(0, workers);
+
+  // ---- 分段 -> 首选副本节点的预分配（轮转各段候选，尽量均衡到不同节点）----
+  const queues = new Map();            // node -> [segIndex]（该路的专属队列）
+  workerNodes.forEach(n => queues.set(n, []));
+  const retryQ = [];                   // [{idx, after}] 失败后任意路可补
+  let cursor = 0;
+  for (let i = 0; i < segments.length; i++) {
+    if (dlState.doneSet.has(i)) continue;
+    const s = segments[i];
+    const cands = nodesForRange(dlInfo, s.start, s.start + s.len - 1, liveTopology);
+    const owner = cands.length
+      ? cands[cursor++ % cands.length]
+      : (workerNodes[cursor++ % workerNodes.length] || null);
+    if (owner && queues.has(owner)) queues.get(owner).push(i);
+    else retryQ.push({ idx: i, after: 0 });
+  }
+
+  function hasWork() {
+    if (dlState.doneSet.size >= segments.length) return false;
+    if (dlState.inflight.size > 0) return true;
+    if (retryQ.length) return true;
+    for (const q of queues.values())
+      if (q.some(i => !dlState.doneSet.has(i))) return true;
+    return false;
+  }
+
+  // 认领下一段：先拿本路专属队列，再偷其它路的尾段，最后取公共重试队列。
+  // 被认领段必须在实时拓扑里有可读副本，否则跳过（其原属主可能刚死亡）。
+  function claim(workerNode) {
+    const eligible = idx => {
+      const s = segments[idx];
+      const cands = nodesForRange(dlInfo, s.start, s.start + s.len - 1,
+                                  liveTopology);
+      if (!cands.length) return null;
+      // 被偷来的段若其属主读不了，就退回候选首位，避免空指
+      let prefer = workerNode;
+      if (!prefer || !cands.includes(prefer)) prefer = cands[0];
+      dlState.inflight.set(idx, prefer);
+      if (prefer)
+        dlState.inflightByNode[prefer] = (dlState.inflightByNode[prefer] || 0) + 1;
+      return { idx, prefer, cands };
+    };
+    const mine = workerNode && queues.get(workerNode);
+    if (mine) {
+      while (mine.length) {
+        const idx = mine.shift();
+        if (dlState.doneSet.has(idx)) continue;
+        const job = eligible(idx);
+        if (job) return job;
+        // 本路固定节点读不了此段 -> 放回公共重试队列，让其它存活路补
+        retryQ.push({ idx, after: performance.now() + 400 });
       }
-      const resp = await fetch(
-        `/api/download?path=${encodeURIComponent(path)}&offset=${off}&length=${len}`,
-        { headers: { Authorization: "Bearer " + getToken() }, signal: ctrl.signal });
-      if (chaosTimer) clearTimeout(chaosTimer);
-      if (!resp.ok && resp.status !== 206) throw new Error("HTTP " + resp.status);
-      const buf = await resp.arrayBuffer();
-      const served = (resp.headers.get("X-Served-By") || "").split(",").filter(Boolean);
-      served.forEach(n => dlState.nodeHits[n] = (dlState.nodeHits[n] || 0) + 1);
-      parts.push(buf);
-      off += buf.byteLength;
-      dlState.offset = off;
-      dlState.segs++;
-      setDlPct(off / dlInfo.size * 100);
-      const speed = off / ((performance.now() - t0) / 1000);
-      setDlStatus(`下载中 ${fmtBytes(off)} / ${fmtBytes(dlInfo.size)} · ${fmtBytes(speed)}/s · 段 ${dlState.segs}`);
-      renderNodeHits();
-    } catch (e) {
-      if (chaosTimer) clearTimeout(chaosTimer);
-      dlState.retries++;
-      setDlStatus(`段 @${fmtBytes(off)} 失败（${e.message === "The user aborted a request." ? "混沌中断" : e.message}），重试 …`);
-      await sleep(400);
+    }
+    for (const [n, q] of queues) {
+      if (n === workerNode) continue;
+      while (q.length) {
+        const idx = q.shift();
+        if (dlState.doneSet.has(idx)) continue;
+        const job = eligible(idx);
+        if (job) return job;
+        retryQ.push({ idx, after: performance.now() + 400 });
+      }
+    }
+    for (let k = 0; k < retryQ.length; k++) {
+      if (retryQ[k].after > performance.now()) continue;
+      const [{ idx }] = retryQ.splice(k, 1);
+      if (dlState.doneSet.has(idx)) continue;
+      const job = eligible(idx);
+      if (job) return job;
+      // 暂时全副本不可读（刚杀节点等待拓扑/恢复）：稍后再试
+      retryQ.push({ idx, after: performance.now() + 800 });
+      return null;
+    }
+    return null;
+  }
+
+  let active = 0;
+  let resolveAll;
+  const allDone = new Promise(r => { resolveAll = r; });
+
+  async function pump(workerNode) {
+    active++;
+    try {
+      while (!dlState.aborted && hasWork()) {
+        if (dlState.paused) { await sleep(300); continue; }
+        const job = claim(workerNode);
+        if (!job) {
+          // 仅剩冷却中的重试段：等其解冻；没有在途任务时也要让出 CPU
+          if (dlState.inflight.size === 0) await sleep(350);
+          else await sleep(60);
+          continue;
+        }
+        const { idx, prefer, cands } = job;
+        const s = segments[idx];
+        const ordered = [prefer, ...cands.filter(n => n && n !== prefer)]
+          .filter((n, i, arr) => n && arr.indexOf(n) === i);
+        // 混沌模式：仅打断首跳（模拟偶发网络抖动），后续故障转移尝试不受影响
+        let chaosSignal = null;
+        if (CHAOS() && Math.random() < 0.25) {
+          const c = new AbortController();
+          chaosSignal = c.signal;
+          setTimeout(() => c.abort(), 40 + Math.random() * 260);
+        }
+        try {
+          const r = await fetchSegment(
+            path, s, ordered.length ? ordered : (cands.length ? cands : [prefer]),
+            chaosSignal);
+          // 首选失败但最终成功 -> 故障转移日志（不影响整体进度）
+          const failedAttempts = r.attempts.filter(a => !a.ok);
+          if (failedAttempts.length) {
+            dlState.retries += failedAttempts.length;
+            addFailLog(dlState, idx, failedAttempts[0].node,
+                       failedAttempts[0].err || "读取失败", r.servedBy[0]);
+          } else if (r.attempts.some(a => a.failover)) {
+            // 客户端首选节点可用，但 NameNode 内部发现该副本损坏/读失败而转移
+            dlState.retries += 1;
+            const a0 = r.attempts.find(a => a.failover);
+            addFailLog(dlState, idx, a0.node,
+                       "服务端副本读失败，已自动转移", r.servedBy[0]);
+          }
+          results[idx] = { ok: true, buf: r.buf, nodeBytes: r.nodeBytes,
+                           servedBy: r.servedBy,
+                           failedOver: r.attempts.some(a => !a.ok || a.failover) };
+          r.nodeBytes.forEach((b, n) => {
+            dlState.bytesByNode[n] = (dlState.bytesByNode[n] || 0) + b;
+            dlState.segsByNode[n] = (dlState.segsByNode[n] || 0) + 1;
+          });
+          dlState.doneSet.add(idx);
+          dlState.doneBytes += r.buf.byteLength;
+        } catch (e) {
+          addFailLog(dlState, idx, prefer || "?", e.message, null);
+          dlState.retries++;
+          // 任何一路彻底失败：把该段放回公共队列，由其它存活节点的路补齐
+          retryQ.push({ idx, after: performance.now() + 300 + Math.random() * 500 });
+          await sleep(200);
+        } finally {
+          const pinned = dlState.inflight.get(idx);
+          if (pinned && dlState.inflightByNode[pinned] > 0)
+            dlState.inflightByNode[pinned]--;
+          dlState.inflight.delete(idx);
+          renderSegGrid(dlState);
+          renderContrib(dlState);
+          setDlPct(dlState.doneBytes / dlInfo.size * 100);
+          const speed = dlState.doneBytes / ((performance.now() - t0) / 1000);
+          setDlStatus(`并行下载中 ${fmtBytes(dlState.doneBytes)} / ${fmtBytes(dlInfo.size)}`
+            + ` · ${fmtBytes(speed)}/s · ${workers} 路并行 · 完成 ${dlState.doneSet.size}/${segments.length} 段`);
+        }
+      }
+    } finally {
+      active--;
+      if (active === 0) resolveAll();
     }
   }
+
+  // 启动 worker 路（每路绑定一个副本节点；路数多于节点数时复用节点）
+  const pumps = [];
+  for (let w = 0; w < workers; w++)
+    pumps.push(pump(workerNodes.length ? workerNodes[w % workerNodes.length] : null));
+  await allDone;
+  clearInterval(topologyTimer);
+
   document.getElementById("dl-start").disabled = false;
   document.getElementById("dl-pause").disabled = true;
   if (dlState.aborted) { setDlStatus("已取消"); return; }
-  if (off < dlInfo.size) { setDlStatus("暂停中（可继续）"); return; }
+  if (dlState.doneSet.size < segments.length) {
+    setDlStatus("暂停中（已完成分段保留，可继续）");
+    return;
+  }
 
-  // 完整性校验
-  setDlStatus("下载完成，正在校验 sha256 …");
-  const merged = new Uint8Array(parts.reduce((s, b) => s + b.byteLength, 0));
+  // ---- 顺序拼装（results 按段号排列，并行完成顺序不影响最终字节序）----
+  setDlStatus("全部分段就位，按序拼装并校验 sha256 …");
+  const merged = new Uint8Array(dlInfo.size);
   let pos = 0;
-  for (const b of parts) { merged.set(new Uint8Array(b), pos); pos += b.byteLength; }
+  for (let i = 0; i < results.length; i++) {
+    merged.set(new Uint8Array(results[i].buf), pos);
+    pos += results[i].buf.byteLength;
+  }
+
   const hash = await sha256Hex(merged.buffer);
-  const okHash = hash === dlInfo.content_hash;
+  const expect = dlInfo.content_hash_full || dlInfo.content_hash;
+  const okHash = hash === expect;
   dlState.buffer = merged;
   dlState.partial = false;
-  document.getElementById("dl-save").disabled = false;
+  document.getElementById("dl-save").disabled = !okHash;
   const box = document.getElementById("dl-result");
   box.style.display = "";
+  const contrib = Object.entries(dlState.bytesByNode)
+    .sort((a, b) => b[1] - a[1])
+    .map(([n, b]) => `<span style="color:${colorFor(n)}"><b>${esc(n)}</b> ${fmtBytes(b)}（${(b / dlInfo.size * 100).toFixed(1)}%）</span>`)
+    .join("　");
   box.innerHTML = `
     <div class="trace-box">
-      <div class="step">${okHash ? "✅" : "❌"} 完整性校验：本地 sha256 ${okHash ? "与服务端一致" : "不一致！"}</div>
+      <div class="step">${okHash ? "✅" : "❌"} 完整性校验：拼装后本地 sha256 ${okHash ? "与原文件一致" : "不一致！"}</div>
       <div class="step mono small">${esc(hash.slice(0, 48))}…</div>
-      <div class="step">${dlState.segs} 个分段 · 重试 ${dlState.retries} 次 · 副本命中：${
-        Object.entries(dlState.nodeHits).map(([n, c]) => `${n}×${c}`).join(" ")}</div>
+      <div class="step">${segments.length} 个分段 · ${workers} 路并行 · 故障转移/重试 ${dlState.retries} 次</div>
+      <div class="step">节点最终贡献：${contrib}</div>
     </div>`;
-  setDlStatus(okHash ? "下载完成 ✓（校验通过）" : "下载完成但校验失败");
-  toast(okHash ? "下载完成，校验通过" : "校验失败！", okHash ? "ok" : "bad");
-}
-
-function renderNodeHits() {
-  const box = document.getElementById("dl-nodes");
-  const hits = dlState?.nodeHits || {};
-  const total = Object.values(hits).reduce((a, b) => a + b, 0) || 1;
-  box.innerHTML = Object.entries(hits).map(([n, c]) => `
-    <span class="badge acc plain" style="margin-right:6px">${esc(n)} ${(c / total * 100).toFixed(0)}%</span>`).join("");
+  setDlStatus(okHash ? "下载完成 ✓（多副本并行，校验通过，字节序与原文件一致）"
+                     : "下载完成但校验失败，请重试");
+  toast(okHash ? "并行下载完成，sha256 校验通过" : "校验失败！", okHash ? "ok" : "bad");
+  renderSegGrid(dlState);
+  renderContrib(dlState);
 }
 
 document.getElementById("dl-save").onclick = () => {
